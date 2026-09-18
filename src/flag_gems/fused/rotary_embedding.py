@@ -18,7 +18,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
+from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
@@ -215,7 +215,8 @@ def apply_rotary_pos_emb(
         q_embed: (*, q_heads, head_dim)
         k_embed: (*, k_heads, head_dim)
     """
-    logger.debug("GEMS ROTARY_POS_EMBEDDING")
+    if not torch.compiler.is_compiling():
+        logger.debug("GEMS ROTARY_POS_EMBEDDING")
     assert (
         k.shape[-1] == q.shape[-1]
     ), f"q and k must have the same last dimension, got {q.shape} and {k.shape}"
@@ -249,6 +250,16 @@ def apply_rotary_pos_emb(
 
     q = q.view(-1, q.shape[-2], q.shape[-1])
     k = k.view(-1, k.shape[-2], k.shape[-1])
+
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.rotary_embedding import rotary_embedding_inplace
+
+        if not inplace or position_ids is None:
+            raise NotImplementedError(
+                "PT2 RoPE currently requires inplace=True and explicit position_ids"
+            )
+        rotary_embedding_inplace(q, k, cos, sin, position_ids, rotary_interleaved)
+        return q.view(q_shape), k.view(k_shape)
 
     n_tokens, q_heads, head_dim = q.shape
 

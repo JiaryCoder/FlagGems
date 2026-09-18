@@ -17,6 +17,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+from flag_gems import runtime
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,21 @@ def hc_head_fused_kernel(
     hc_mult: int,
 ) -> torch.Tensor:
     """HC head fused kernel: fully fused Triton implementation."""
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.mhc import hc_head_fused_kernel as _pt2_hc_head
+
+        _pt2_hc_head(
+            hs_flat,
+            fn,
+            hc_scale,
+            hc_base,
+            out,
+            hidden_size,
+            rms_eps,
+            hc_eps,
+            hc_mult,
+        )
+        return out
     logger.debug("GEMS HC_HEAD_FUSED")
     assert hs_flat.dtype == torch.bfloat16
     assert fn.dtype == torch.float32

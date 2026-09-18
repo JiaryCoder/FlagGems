@@ -20,7 +20,6 @@ from typing import Iterable, Sequence, Tuple
 import torch
 import triton
 import triton.language as tl
-
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.codegen_config_utils import get_heuristics_for_num_warps
 
@@ -173,6 +172,17 @@ def ordered_stride(shape: Shape, order: Perm) -> Stride:
 
 def stride_order(strides):
     # we also handle negative strides
+    if torch.compiler.is_compiling():
+        # Dynamo cannot sort with symbolic keys. Explicit comparisons preserve
+        # stable ordering and guard only the relative order of runtime strides.
+        order = list(range(len(strides)))
+        for i in range(1, len(order)):
+            for j in range(i, 0, -1):
+                if abs(strides[order[j]]) < abs(strides[order[j - 1]]):
+                    order[j], order[j - 1] = order[j - 1], order[j]
+                else:
+                    break
+        return order
     return sorted(range(len(strides)), key=lambda i: abs(strides[i]))
 
 
@@ -246,10 +256,31 @@ class MemOverlap(enum.Enum):
     TooHard = 2
 
 
+def is_non_overlapping_and_dense(x: torch.Tensor):
+    """Evaluate density from symbolic metadata when Dynamo is tracing.
+
+    The aten predicate returns a Python bool and cannot itself be an FX node.
+    Ignore singleton dimensions, then require a packed stride progression.
+    Eager keeps the original aten implementation.
+    """
+    if not torch.compiler.is_compiling():
+        return torch.ops.aten.is_non_overlapping_and_dense(x)
+    if x.numel() == 0:
+        return True
+    expected_stride = 1
+    for axis in stride_order(x.stride()):
+        if x.shape[axis] < 2:
+            continue
+        if x.stride(axis) != expected_stride:
+            return False
+        expected_stride *= x.shape[axis]
+    return True
+
+
 def has_internal_overlapping(x: torch.Tensor):
     if x.is_contiguous():
         return MemOverlap.No
-    if torch.ops.aten.is_non_overlapping_and_dense(x):
+    if is_non_overlapping_and_dense(x):
         return MemOverlap.No
     for size, stride in zip(x.size(), x.stride()):
         if size > 1 and stride == 0:

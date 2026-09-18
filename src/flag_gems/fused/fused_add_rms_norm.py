@@ -15,9 +15,10 @@
 import logging
 import math
 
+import torch
 import triton
 import triton.language as tl
-
+from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
@@ -123,6 +124,15 @@ def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
     Both `x` and `residual` tensors will be modified. Use with caution if these tensors
     are reused elsewhere or require gradients.
     """
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.rms_norm import rms_norm as _pt2_rms_norm
+
+        if len(normalized_shape) != 1:
+            raise NotImplementedError("PT2 RMSNorm requires one normalized dimension")
+        torch._check(normalized_shape[0] == weight.numel())
+        return _pt2_rms_norm(
+            x.contiguous(), residual.contiguous(), weight.contiguous(), eps
+        )
     logger.debug(
         "GEMS FUSED_ADD_RMS_NORM FORWARD, [input shape]: %s, [residual shape]: %s, [weight shape]: %s",
         x.size(),

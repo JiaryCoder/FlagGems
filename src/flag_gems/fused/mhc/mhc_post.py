@@ -32,6 +32,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+from flag_gems import runtime
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,10 @@ def mhc_post(
     Returns:
         out: (N, hc_mult, H), bfloat16
     """
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.mhc import mhc_post as _pt2_mhc_post
+
+        return _pt2_mhc_post(x, residual, post_layer_mix, comb_res_mix)
     logger.debug(
         "GEMS MHC_POST FORWARD, x=%s, residual=%s, post_layer_mix=%s, comb_res_mix=%s",
         x.shape,
