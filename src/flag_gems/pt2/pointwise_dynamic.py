@@ -31,6 +31,7 @@ Tensor. Only immutable code-generation state is retained by a plan.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
@@ -64,12 +65,16 @@ from flag_gems.utils.pointwise_dynamic import (
     PointwiseKernelMaterialization,
     _balanced_grid_partition,
 )
-from flag_gems.utils.shape_utils import broadcasted_stride, stride_order
+from flag_gems.utils.shape_utils import (
+    broadcasted_stride,
+    heuristics_for_tile_size,
+    stride_order,
+)
 
 _HAS_TRITON_OP = hasattr(torch.library, "triton_op") and hasattr(
     torch.library, "wrap_triton"
 )
-_SUPPORTED_LAYOUTS = ("contiguous_c", "split_last_dim_c", "strided")
+_SUPPORTED_LAYOUTS = ("contiguous_c", "strided")
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -104,13 +109,21 @@ class PointwisePlan:
     scalar_input_indices: tuple[int, ...]
     materialization: PointwiseKernelMaterialization
     num_warps_policy: Callable[[int], int]
-    tensor_stride_order: tuple[int, ...]
-    scalar_stride_order: tuple[int, ...]
     num_outputs: int = 1
 
     @property
     def jit_function(self):
         return self.materialization.jit_function
+
+    # Retain the old diagnostic attributes without storing a stride order in
+    # each plan. Execution derives its order from the actual runtime strides.
+    @property
+    def tensor_stride_order(self) -> tuple[int, ...]:
+        return tuple(reversed(range(self.kernel_ndim)))
+
+    @property
+    def scalar_stride_order(self) -> tuple[int, ...]:
+        return tuple(range(self.kernel_ndim))
 
     @property
     def primary_input_indices(self) -> tuple[int, ...]:
@@ -232,12 +245,12 @@ def materialize_pointwise_plan(
         raise ValueError(f"expected a nonnegative rank, got {ndim!r}")
     if dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"unsupported pointwise dtype: {dtype}")
-    if layout_class not in _SUPPORTED_LAYOUTS:
-        raise ValueError(f"unsupported pointwise layout class: {layout_class!r}")
     # The old split-view plan already uses the general strided kernel ABI.
     # Preserve explicit preparation through that public spelling as well.
     if layout_class == "split_last_dim_c":
         layout_class = "strided"
+    if layout_class not in _SUPPORTED_LAYOUTS:
+        raise ValueError(f"unsupported pointwise layout class: {layout_class!r}")
 
     family = _family(op_name)
     key = (family.name, ndim, dtype, layout_class)
@@ -268,8 +281,6 @@ def materialize_pointwise_plan(
         scalar_input_indices=family.scalar_input_indices,
         materialization=generated,
         num_warps_policy=get_heuristics_for_num_warps_fn(),
-        tensor_stride_order=tuple(reversed(range(kernel_ndim))),
-        scalar_stride_order=tuple(range(kernel_ndim)),
         num_outputs=family.num_outputs,
     )
     _NEXT_PLAN_TOKEN += 1
@@ -287,6 +298,10 @@ def materialize_pointwise_family_plans(
 ) -> tuple[PointwisePlan, ...]:
     """Freeze a Cartesian product of structural plans before Dynamo capture."""
 
+    # Each inner iterable must be reusable across families and ranks.
+    ranks = tuple(ranks)
+    dtypes = tuple(dtypes)
+    layout_classes = tuple(layout_classes)
     plans = []
     for op_name in op_names:
         for ndim in ranks:
@@ -344,6 +359,12 @@ def _resolve_plan_token(op_name: str, inputs: tuple[torch.Tensor, ...]) -> int:
         raise RuntimeError(
             f"{family.name!r} requires {family.num_inputs} inputs, got {len(inputs)}"
         )
+    for tensor in inputs:
+        if tensor.dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(
+                f"Unsupported PT2 pointwise dtype {tensor.dtype} for {family.name!r}; "
+                "supported dtypes are float16, bfloat16 and float32"
+            )
     _, shape, _, dtypes, collapsed = family.source_pointwise.prepare_metadata(*inputs)
     key = (
         family.name,
@@ -385,7 +406,7 @@ def _runtime_strides(plan: PointwisePlan, tensor: torch.Tensor, task_shape):
 
 
 def _partition(plan: PointwisePlan, out: torch.Tensor):
-    """PT2-safe transcription of the generated wrapper's launch policy."""
+    """Use the eager wrapper's tile and balanced-grid helpers."""
 
     shape = _task_shape(plan, out)
     num_tasks = out.numel()
@@ -396,24 +417,13 @@ def _partition(plan: PointwisePlan, out: torch.Tensor):
         # That ABI must be materialized outside Dynamo as a different plan.
         torch._check(num_tasks <= 2_147_483_647)
 
-    if plan.materialization.prefer_1d_tile:
-        tile_size = min(
-            plan.materialization.max_tile_size,
-            triton.next_power_of_2(num_tasks),
-        )
-        tile_sizes = (tile_size,)
-        num_tiles = triton.cdiv(num_tasks, tile_size)
-    else:
-        remaining = plan.materialization.max_tile_size
-        reversed_tiles = []
-        for axis in reversed(range(plan.kernel_ndim)):
-            tile_size = min(remaining, triton.next_power_of_2(shape[axis]))
-            reversed_tiles.append(tile_size)
-            remaining = max(1, remaining // tile_size)
-        tile_sizes = tuple(reversed(reversed_tiles))
-        num_tiles = 1
-        for size, tile_size in zip(shape, tile_sizes):
-            num_tiles *= triton.cdiv(size, tile_size)
+    tile_shape = (num_tasks,) if plan.materialization.prefer_1d_tile else shape
+    tile_sizes = heuristics_for_tile_size(
+        plan.materialization.max_tile_size, *tile_shape
+    )
+    num_tiles = math.prod(
+        triton.cdiv(size, tile_size) for size, tile_size in zip(tile_shape, tile_sizes)
+    )
 
     if plan.materialization.balance_grid:
         num_ctas, tiles_per_cta = _balanced_grid_partition(
@@ -422,10 +432,7 @@ def _partition(plan: PointwisePlan, out: torch.Tensor):
     else:
         num_ctas = min(plan.materialization.max_grid_size[0], num_tiles)
         tiles_per_cta = triton.cdiv(num_tiles, num_ctas)
-    tile_volume = 1
-    for tile_size in tile_sizes:
-        tile_volume *= tile_size
-    num_warps = plan.num_warps_policy(tile_volume)
+    num_warps = plan.num_warps_policy(math.prod(tile_sizes))
     return (
         (num_ctas, 1, 1),
         num_tasks,
