@@ -1747,3 +1747,19 @@ __all__ = [
     "only_enable",
     "use_gems",
 ]
+
+# Register compiler-visible kernels and generate structural pointwise plans
+# before a caller can trace a public FlagGems entry point. Vendor replacements
+# keep their own launchers; these contracts currently cover the common NVIDIA
+# kernels. No tensors or token counts are retained by this preparation.
+if vendor_name == "nvidia" and hasattr(torch.library, "triton_op"):
+    from flag_gems import pt2 as _pt2
+
+    _pt2.materialize_pointwise_family_plans(
+        _pt2.ACTIVATION_POINTWISE_FAMILIES
+        + _pt2.ACTIVATION_BACKWARD_POINTWISE_FAMILIES,
+        # Scalar through rank-five inputs match the existing activation tests.
+        # Other structural ranks can be materialized explicitly before compile.
+        ranks=(0, 1, 2, 3, 4, 5),
+        layout_classes=("contiguous_c", "strided"),
+    )

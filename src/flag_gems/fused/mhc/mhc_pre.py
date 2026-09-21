@@ -28,6 +28,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
+
 logger = logging.getLogger(__name__)
 
 
@@ -639,6 +641,21 @@ def mhc_pre(
     - hc_mult == 4: specialized fused Triton kernel
     - hc_mult != 4: generic Triton kernel aligned to reference math
     """
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.mhc import mhc_pre as _pt2_mhc_pre
+
+        return _pt2_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+        )
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
 

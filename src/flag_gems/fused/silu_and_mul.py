@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
 from flag_gems.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,10 @@ class SiluAndMul(torch.autograd.Function):
 
 
 def silu_and_mul(A, B):
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.pointwise_dynamic import silu_and_mul_pointwise
+
+        return silu_and_mul_pointwise(A, B)
     return SiluAndMul.apply(A, B)
 
 

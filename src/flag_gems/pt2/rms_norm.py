@@ -46,6 +46,9 @@ from flag_gems.fused.fused_add_rms_norm import (
     fused_add_rms_norm_loop_kernel as _fused_loop_entry,
 )
 from flag_gems.ops.rms_norm import rms_norm as _eager_rms_norm
+from flag_gems.ops.rms_norm import rms_norm_grad_dw_kernel as _grad_dw_entry
+from flag_gems.ops.rms_norm import rms_norm_grad_dx_kernel as _grad_dx_entry
+from flag_gems.ops.rms_norm import rms_norm_grad_dx_loop_kernel as _grad_dx_loop_entry
 from flag_gems.ops.rms_norm import rms_norm_kernel as _rms_small_entry
 from flag_gems.ops.rms_norm import rms_norm_loop_kernel as _rms_loop_entry
 from flag_gems.pt2.manifest import CompileKind, CompileOpSpec, register_compile_spec
@@ -65,6 +68,9 @@ RMS_NORM_SMALL_JIT = _rms_small_entry.jit_function
 RMS_NORM_LOOP_AUTOTUNER = _rms_loop_entry.fn
 FUSED_ADD_RMS_NORM_SMALL_JIT = _fused_small_entry.jit_function
 FUSED_ADD_RMS_NORM_LOOP_JIT = _fused_loop_entry.jit_function
+RMS_NORM_GRAD_DX_JIT = _grad_dx_entry.jit_function
+RMS_NORM_GRAD_DX_LOOP_JIT = _grad_dx_loop_entry.jit_function
+RMS_NORM_GRAD_DW_JIT = _grad_dw_entry.jit_function
 
 
 def supports_pt2_rms_norm() -> bool:
@@ -104,13 +110,12 @@ def _check_fused_contract(
 
 if _HAS_TRITON_OP:
 
-    @torch.library.triton_op("flag_gems_pt2::rms_norm", mutates_args={})
-    def _rms_norm_op(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    def _rms_norm_forward(x, weight, eps):
         num_rows, hidden_size = _check_standard_contract(x, weight)
         out = torch.empty_like(x)
         inv_rms = torch.empty((num_rows,), device=x.device, dtype=torch.float32)
         if num_rows == 0:
-            return out
+            return out, inv_rms
         if hidden_size <= _SMALL_HIDDEN_LIMIT:
             block_size = triton.next_power_of_2(hidden_size)
             torch.library.wrap_triton(RMS_NORM_SMALL_JIT)[(num_rows,)](
@@ -130,7 +135,92 @@ if _HAS_TRITON_OP:
             torch.library.wrap_triton(RMS_NORM_LOOP_AUTOTUNER)[(num_rows,)](
                 out, inv_rms, x, weight, hidden_size, eps
             )
-        return out
+        return out, inv_rms
+
+    @torch.library.triton_op("flag_gems_pt2::rms_norm", mutates_args={})
+    def _rms_norm_op(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        return _rms_norm_forward(x, weight, eps)[0]
+
+    @torch.library.triton_op("flag_gems_pt2::rms_norm_training", mutates_args={})
+    def _rms_norm_training_op(
+        x: torch.Tensor, weight: torch.Tensor, eps: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Auxiliary output is private to the adapter. It is saved by autograd,
+        # while the public FlagGems API continues to return only the result.
+        return _rms_norm_forward(x, weight, eps)
+
+    @torch.library.triton_op("flag_gems_pt2::rms_norm_backward", mutates_args={})
+    def _rms_norm_backward_op(
+        dy: torch.Tensor,
+        x: torch.Tensor,
+        inv_rms: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_rows, hidden_size = _check_standard_contract(x, weight)
+        dy = dy.contiguous()
+        dx = torch.empty_like(x)
+        if num_rows == 0:
+            return dx, torch.zeros_like(weight)
+        if hidden_size <= _SMALL_HIDDEN_LIMIT:
+            block_size = triton.next_power_of_2(hidden_size)
+            kernel = RMS_NORM_GRAD_DX_JIT
+        else:
+            block_size = _FUSED_LOOP_BLOCK_SIZE
+            kernel = RMS_NORM_GRAD_DX_LOOP_JIT
+        torch.library.wrap_triton(kernel)[(num_rows,)](
+            x,
+            dy,
+            inv_rms,
+            dx,
+            weight,
+            hidden_size,
+            1,
+            hidden_size,
+            1,
+            hidden_size,
+            eps,
+            block_size,
+        )
+        row_block_size = 16
+        col_block_size = 256
+        row_blocks = triton.cdiv(num_rows, row_block_size)
+        col_blocks = triton.cdiv(hidden_size, col_block_size)
+        partial = torch.empty(
+            (row_blocks, hidden_size), device=x.device, dtype=torch.float32
+        )
+        torch.library.wrap_triton(RMS_NORM_GRAD_DW_JIT)[(row_blocks, col_blocks)](
+            x,
+            dy,
+            inv_rms,
+            partial,
+            hidden_size,
+            1,
+            hidden_size,
+            1,
+            num_rows,
+            hidden_size,
+            row_block_size,
+            col_block_size,
+        )
+        dw = partial.sum(dim=0, dtype=torch.float32).to(weight.dtype)
+        return dx, dw
+
+    def _setup_rms_context(ctx, inputs, output):
+        x, weight, eps = inputs
+        _, inv_rms = output
+        ctx.save_for_backward(x, weight, inv_rms)
+        ctx.eps = eps
+        ctx.mark_non_differentiable(inv_rms)
+
+    def _rms_backward(ctx, grad_output, grad_inv_rms):
+        x, weight, inv_rms = ctx.saved_tensors
+        dx, dw = _rms_norm_backward_op(grad_output, x, inv_rms, weight, ctx.eps)
+        return dx, dw, None
+
+    _rms_norm_training_op.register_autograd(
+        _rms_backward, setup_context=_setup_rms_context
+    )
 
     @torch.library.triton_op(
         "flag_gems_pt2::fused_add_rms_norm",
@@ -171,6 +261,8 @@ if _HAS_TRITON_OP:
 
 else:
     _rms_norm_op = None
+    _rms_norm_training_op = None
+    _rms_norm_backward_op = None
     _fused_add_rms_norm_op = None
 
 
@@ -193,6 +285,29 @@ RMS_NORM_SPEC = register_compile_spec(
         source_kernel=(
             "flag_gems.ops.rms_norm.{rms_norm_kernel.jit_function,"
             "rms_norm_loop_kernel.fn}"
+        ),
+        dynamic_dims=("leading_token_dims",),
+        requires=_RMS_REQUIRES,
+    )
+)
+
+RMS_NORM_TRAINING_SPEC = register_compile_spec(
+    CompileOpSpec(
+        op_name="flag_gems_pt2::rms_norm_training",
+        kind=CompileKind.TRITON_TRACEABLE,
+        source_kernel=RMS_NORM_SPEC.source_kernel,
+        dynamic_dims=("leading_token_dims",),
+        requires=(*_RMS_REQUIRES, "torch.library.register_autograd"),
+    )
+)
+
+RMS_NORM_BACKWARD_SPEC = register_compile_spec(
+    CompileOpSpec(
+        op_name="flag_gems_pt2::rms_norm_backward",
+        kind=CompileKind.TRITON_TRACEABLE,
+        source_kernel=(
+            "flag_gems.ops.rms_norm.{rms_norm_grad_dx_kernel,"
+            "rms_norm_grad_dx_loop_kernel,rms_norm_grad_dw_kernel}.jit_function"
         ),
         dynamic_dims=("leading_token_dims",),
         requires=_RMS_REQUIRES,
@@ -241,6 +356,8 @@ def rms_norm(
             # contiguous checks as the fail-closed kernel ABI.
             x = x.contiguous()
             weight = weight.contiguous()
+            if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+                return _rms_norm_training_op(x, weight, eps)[0]
             return _rms_norm_op(x, weight, eps)
         _fused_add_rms_norm_op(x, residual, weight, eps)
         return x, residual
@@ -255,9 +372,11 @@ __all__ = [
     "FUSED_ADD_RMS_NORM_LOOP_JIT",
     "FUSED_ADD_RMS_NORM_SMALL_JIT",
     "FUSED_ADD_RMS_NORM_SPEC",
+    "rms_norm",
+    "RMS_NORM_BACKWARD_SPEC",
     "RMS_NORM_LOOP_AUTOTUNER",
     "RMS_NORM_SMALL_JIT",
     "RMS_NORM_SPEC",
-    "rms_norm",
+    "RMS_NORM_TRAINING_SPEC",
     "supports_pt2_rms_norm",
 ]

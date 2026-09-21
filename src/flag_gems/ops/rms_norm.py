@@ -402,4 +402,11 @@ class RmsNorm(torch.autograd.Function):
 
 
 def rms_norm(x, normalized_shape, weight, eps=1e-5):
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.rms_norm import rms_norm as _pt2_rms_norm
+
+        if len(normalized_shape) != 1:
+            raise NotImplementedError("PT2 RMSNorm requires one normalized dimension")
+        torch._check(normalized_shape[0] == weight.numel())
+        return _pt2_rms_norm(x, None, weight, eps)
     return RmsNorm.apply(x, normalized_shape, weight, eps)

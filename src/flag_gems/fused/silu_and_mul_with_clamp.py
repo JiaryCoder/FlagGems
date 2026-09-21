@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
 from flag_gems.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,11 @@ class SiluAndMulWithClamp(torch.autograd.Function):
 
 
 def silu_and_mul_with_clamp(x, y, limit):
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.pointwise_dynamic import silu_and_mul_with_clamp_pointwise
+
+        limit_tensor = torch.tensor(limit, device=x.device, dtype=x.dtype)
+        return silu_and_mul_with_clamp_pointwise(x, y, limit_tensor)
     return SiluAndMulWithClamp.apply(x, y, limit)
 
 

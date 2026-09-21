@@ -36,6 +36,7 @@ from flag_gems.utils.shape_utils import (
     broadcasted_stride,
     check_tensor_attributes,
     has_internal_overlapping,
+    is_non_overlapping_and_dense,
 )
 from flag_gems.utils.tensor_wrapper import StridedBuffer
 from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
@@ -1283,6 +1284,7 @@ class PointwiseKernelMaterialization:
     max_num_warps_per_cta: int
     prefer_block_pointer: bool
     prefer_1d_tile: bool
+    balance_grid: bool = False
 
 
 class ComplexMode(Enum):
@@ -1615,9 +1617,44 @@ class PointwiseDynamicFunction:
             all_c_contiguous(tensors)
             or (
                 all_the_same_stride(tensors)
-                and torch.ops.aten.is_non_overlapping_and_dense(tensors[0])
+                and is_non_overlapping_and_dense(tensors[0])
             )
         )
+
+    def prepare_metadata(self, *args, outputs=(), output_indices=None):
+        """Infer the common task without pointer wrappers or allocation.
+
+        Both the eager launcher and PT2 use these broadcasting, promotion and
+        dimension-collapse rules. The returned tensors are allocation
+        references for this invocation only; they are never cached in a plan.
+        """
+        schema = self.fx
+        inputs = tuple(arg for i, arg in enumerate(args) if schema.is_tensor(i))
+        tensors = tuple(outputs) + inputs
+        if output_indices is None:
+            output_indices = range(schema.num_output_tensors())
+        dtypes = []
+        for i in output_indices:
+            *indices, method = schema._promotion_methods[i]
+            _, dtype = type_promotion(
+                *(args[j] for j in indices), type_promotion=method
+            )
+            dtypes.append(dtype)
+
+        collapsed = self.use_fast_path(tensors)
+        if collapsed:
+            shape = tensors[0].shape
+            task_shape = (tensors[0].numel(),)
+            reference = tensors[0]
+        else:
+            shape = broadcast_shapes(tuple(tensor.shape for tensor in inputs))
+            task_shape = shape
+            reference = None
+            for tensor in tensors:
+                if tensor.shape == shape:
+                    reference = tensor
+                    break
+        return task_shape, shape, reference, tuple(dtypes), collapsed
 
     def prepare_args(self, *args, _skip_tensor_check=False, **kwargs):
         # output allocation(when needed)
@@ -1644,19 +1681,22 @@ class PointwiseDynamicFunction:
                 )
         in_tensors = [item for i, item in enumerate(args) if schema.is_tensor(i)]
 
-        # output dtype promotions
-        outputs_dtypes_for_allocation = []
-        for i in outputs_that_need_allocation:
-            *arg_indices, method = schema._promotion_methods[i]
-            promote_args = (args[j] for j in arg_indices)
-            _, dtype = type_promotion(*promote_args, type_promotion=method)
-            outputs_dtypes_for_allocation.append(dtype)
-
         tensors = out_tensors + in_tensors
         INT32_MAX = torch.iinfo(torch.int32).max
         if tensors[0].numel() > INT32_MAX:
             self.config.prefer_block_pointer = False
-        if self.use_fast_path(tensors):  # dimension collapse & use physical ordering
+        (
+            task_shape,
+            output_shape,
+            allocation_reference,
+            outputs_dtypes_for_allocation,
+            collapsed,
+        ) = self.prepare_metadata(
+            *args,
+            outputs=out_tensors,
+            output_indices=outputs_that_need_allocation,
+        )
+        if collapsed:  # dimension collapse & use physical ordering
             allocated_outputs = [
                 self._alloc_output(
                     tensors[0].shape,
@@ -1689,10 +1729,6 @@ class PointwiseDynamicFunction:
             # a simple strategy: all the undefined tensors will follow the first
             # tensor that is not broadcated, no attempts to simplify task, no reordering,
             # no dimenion collapsing
-            shapes = tuple(item.shape for item in in_tensors)
-
-            task_shape = broadcast_shapes(shapes)
-
             if out_tensors:
                 for index, item in enumerate(out_tensors):
                     if list(item.shape) != list(task_shape):
@@ -1706,28 +1742,15 @@ class PointwiseDynamicFunction:
                         )
 
             ndim = len(task_shape)
-            for item in tensors:
-                if item.shape == task_shape:
-                    allocated_outputs = [
-                        self._alloc_output(
-                            item.shape,
-                            dtype,
-                            item.device,
-                            like_tensor=item,
-                        )
-                        for dtype in outputs_dtypes_for_allocation
-                    ]
-                    break
-            else:  # nobreak
-                device = tensors[0].device
-                allocated_outputs = [
-                    self._alloc_output(
-                        task_shape,
-                        dtype,
-                        device,
-                    )
-                    for dtype in outputs_dtypes_for_allocation
-                ]
+            allocated_outputs = [
+                self._alloc_output(
+                    output_shape,
+                    dtype,
+                    tensors[0].device,
+                    like_tensor=allocation_reference,
+                )
+                for dtype in outputs_dtypes_for_allocation
+            ]
             args = tuple(
                 (
                     StridedBuffer(
@@ -1886,6 +1909,7 @@ class PointwiseDynamicFunction:
             max_num_warps_per_cta=self.config.max_num_warps_per_cta,
             prefer_block_pointer=self.config.prefer_block_pointer,
             prefer_1d_tile=self.config.prefer_1d_tile,
+            balance_grid=self.config.balance_grid,
         )
 
         return overload
@@ -1899,7 +1923,7 @@ class PointwiseDynamicFunction:
         accepted, so different token counts reuse the same materialization.
         """
 
-        key = f"{ndim}_{self.config.prefer_block_pointer}"
+        key = f"{ndim}_{self.config.prefer_block_pointer}_{self.config.balance_grid}"
         if key not in self._materialization_cache:
             self.instantiate(ndim)
         return self._materialization_cache[key]

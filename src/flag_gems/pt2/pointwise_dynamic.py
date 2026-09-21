@@ -23,24 +23,39 @@ shape value. Rank, dtype, layout family, and guarded GELU approximation select
 an immutable plan; concrete shapes and launch parameters remain symbolic or
 runtime-specialized after the Dynamo boundary.
 
-This adapter intentionally supports the common inference subset used by the
-vLLM activation backend: one output, tensor-only inputs, equal-dtype elementwise
-operands, and optional scalar-tensor broadcasts. Unsupported pointwise schemas
-are rejected while materializing instead of silently dropping eager promotion,
-mutation, autotune, or wrapper semantics.
+Forward and first-order backward reuse the original pointwise kernels and
+their shared metadata preparation. Broadcasting, dtype promotion and physical
+dimension collapse are inferred for each invocation, not saved from a warmup
+Tensor. Only immutable code-generation state is retained by a plan.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
 import torch
 import triton
 
+from flag_gems.fused.gelu_and_mul import gelu_and_mul as _eager_gelu
+from flag_gems.fused.gelu_and_mul import (
+    gelu_none_and_mul_grad_kernel as _gelu_none_grad_source,
+)
 from flag_gems.fused.gelu_and_mul import gelu_none_and_mul_kernel as _gelu_none_source
+from flag_gems.fused.gelu_and_mul import (
+    gelu_tanh_and_mul_grad_kernel as _gelu_tanh_grad_source,
+)
 from flag_gems.fused.gelu_and_mul import gelu_tanh_and_mul_kernel as _gelu_tanh_source
+from flag_gems.fused.silu_and_mul import silu_and_mul as _eager_silu
+from flag_gems.fused.silu_and_mul import silu_and_mul_grad_kernel as _silu_grad_source
 from flag_gems.fused.silu_and_mul import silu_and_mul_kernel as _silu_source
+from flag_gems.fused.silu_and_mul_with_clamp import (
+    silu_and_mul_with_clamp as _eager_silu_clamp,
+)
+from flag_gems.fused.silu_and_mul_with_clamp import (
+    silu_and_mul_with_clamp_grad_kernel as _silu_clamp_grad_source,
+)
 from flag_gems.fused.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp_kernel as _silu_clamp_source,
 )
@@ -49,13 +64,18 @@ from flag_gems.utils.codegen_config_utils import get_heuristics_for_num_warps_fn
 from flag_gems.utils.pointwise_dynamic import (
     PointwiseDynamicFunction,
     PointwiseKernelMaterialization,
+    _balanced_grid_partition,
+)
+from flag_gems.utils.shape_utils import (
+    broadcasted_stride,
+    heuristics_for_tile_size,
+    stride_order,
 )
 
 _HAS_TRITON_OP = hasattr(torch.library, "triton_op") and hasattr(
     torch.library, "wrap_triton"
 )
-_SUPPORTED_RANKS = (1, 2, 3)
-_SUPPORTED_LAYOUTS = ("contiguous_c", "split_last_dim_c")
+_SUPPORTED_LAYOUTS = ("contiguous_c", "strided")
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -67,6 +87,7 @@ class PointwiseFamilySpec:
     source_pointwise: PointwiseDynamicFunction
     num_inputs: int
     scalar_input_indices: tuple[int, ...] = ()
+    num_outputs: int = 1
 
     @property
     def primary_input_indices(self) -> tuple[int, ...]:
@@ -89,12 +110,21 @@ class PointwisePlan:
     scalar_input_indices: tuple[int, ...]
     materialization: PointwiseKernelMaterialization
     num_warps_policy: Callable[[int], int]
-    tensor_stride_order: tuple[int, ...]
-    scalar_stride_order: tuple[int, ...]
+    num_outputs: int = 1
 
     @property
     def jit_function(self):
         return self.materialization.jit_function
+
+    # Retain the old diagnostic attributes without storing a stride order in
+    # each plan. Execution derives its order from the actual runtime strides.
+    @property
+    def tensor_stride_order(self) -> tuple[int, ...]:
+        return tuple(reversed(range(self.kernel_ndim)))
+
+    @property
+    def scalar_stride_order(self) -> tuple[int, ...]:
+        return tuple(range(self.kernel_ndim))
 
     @property
     def primary_input_indices(self) -> tuple[int, ...]:
@@ -131,11 +161,12 @@ def register_pointwise_family(spec: PointwiseFamilySpec) -> PointwiseFamilySpec:
     if (
         schema.num_input_tensors() != spec.num_inputs
         or schema.num_non_tensor_args() != 0
-        or schema.num_output_tensors() != 1
+        or schema.num_output_tensors() != spec.num_outputs
+        or spec.num_outputs < 1
     ):
         raise RuntimeError(
             f"Unsupported PT2 pointwise schema for {spec.name!r}: {schema}. "
-            "This adapter requires tensor-only inputs and exactly one output."
+            "This adapter requires tensor-only inputs and matching output arity."
         )
 
     previous = _FAMILIES.get(spec.name)
@@ -170,6 +201,26 @@ ACTIVATION_POINTWISE_FAMILIES = (
     SILU_AND_MUL_WITH_CLAMP_FAMILY.name,
 )
 
+for _forward_name, _source, _num_inputs, _scalars in (
+    (SILU_AND_MUL_FAMILY.name, _silu_grad_source, 3, ()),
+    (GELU_NONE_AND_MUL_FAMILY.name, _gelu_none_grad_source, 3, ()),
+    (GELU_TANH_AND_MUL_FAMILY.name, _gelu_tanh_grad_source, 3, ()),
+    (SILU_AND_MUL_WITH_CLAMP_FAMILY.name, _silu_clamp_grad_source, 4, (3,)),
+):
+    register_pointwise_family(
+        PointwiseFamilySpec(
+            _forward_name + ".backward",
+            _source,
+            num_inputs=_num_inputs,
+            scalar_input_indices=_scalars,
+            num_outputs=2,
+        )
+    )
+
+ACTIVATION_BACKWARD_POINTWISE_FAMILIES = tuple(
+    name + ".backward" for name in ACTIVATION_POINTWISE_FAMILIES
+)
+
 
 def _family(name: str) -> PointwiseFamilySpec:
     try:
@@ -191,10 +242,14 @@ def materialize_pointwise_plan(
 
     if torch.compiler.is_compiling():
         raise RuntimeError("pointwise plan materialization is forbidden inside Dynamo")
-    if ndim not in _SUPPORTED_RANKS:
-        raise ValueError(f"supported ranks are {_SUPPORTED_RANKS}, got rank {ndim}")
+    if not isinstance(ndim, int) or ndim < 0:
+        raise ValueError(f"expected a nonnegative rank, got {ndim!r}")
     if dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"unsupported pointwise dtype: {dtype}")
+    # The old split-view plan already uses the general strided kernel ABI.
+    # Preserve explicit preparation through that public spelling as well.
+    if layout_class == "split_last_dim_c":
+        layout_class = "strided"
     if layout_class not in _SUPPORTED_LAYOUTS:
         raise ValueError(f"unsupported pointwise layout class: {layout_class!r}")
 
@@ -204,15 +259,10 @@ def materialize_pointwise_plan(
     if cached is not None:
         return cached
 
-    # PointwiseDynamic.prepare_args collapses equal-shape C-contiguous tensor
-    # operands to one physical task dimension.  Families with a scalar-tensor
-    # broadcast cannot take that fast path because not all tensor shapes match.
-    # Preserve that exact eager choice instead of merely using the input rank.
-    kernel_ndim = (
-        1
-        if layout_class == "contiguous_c" and not family.scalar_input_indices
-        else ndim
-    )
+    # The call-site metadata decides whether physical dimension collapse is
+    # legal. A scalar broadcast selects a strided plan, even if the main input
+    # is contiguous. The generated kernel is still the original eager kernel.
+    kernel_ndim = 1 if layout_class == "contiguous_c" else ndim
     generated = family.source_pointwise.materialize(kernel_ndim)
     if generated.runtime_chain != ("LibEntry", "JITFunction"):
         raise RuntimeError(
@@ -232,8 +282,7 @@ def materialize_pointwise_plan(
         scalar_input_indices=family.scalar_input_indices,
         materialization=generated,
         num_warps_policy=get_heuristics_for_num_warps_fn(),
-        tensor_stride_order=tuple(reversed(range(kernel_ndim))),
-        scalar_stride_order=tuple(range(kernel_ndim)),
+        num_outputs=family.num_outputs,
     )
     _NEXT_PLAN_TOKEN += 1
     _PLANS_BY_KEY[key] = plan
@@ -250,6 +299,10 @@ def materialize_pointwise_family_plans(
 ) -> tuple[PointwisePlan, ...]:
     """Freeze a Cartesian product of structural plans before Dynamo capture."""
 
+    # Each inner iterable must be reusable across families and ranks.
+    ranks = tuple(ranks)
+    dtypes = tuple(dtypes)
+    layout_classes = tuple(layout_classes)
     plans = []
     for op_name in op_names:
         for ndim in ranks:
@@ -299,13 +352,6 @@ def materialized_pointwise_plans(
     return tuple(plan for plan in plans if plan.op_name == op_name)
 
 
-def _layout_class(family: PointwiseFamilySpec, inputs: tuple[torch.Tensor, ...]) -> str:
-    primary = tuple(inputs[i] for i in family.primary_input_indices)
-    if all(tensor.is_contiguous() for tensor in primary):
-        return "contiguous_c"
-    return "split_last_dim_c"
-
-
 def _resolve_plan_token(op_name: str, inputs: tuple[torch.Tensor, ...]) -> int:
     """Resolve already-materialized metadata; never codegen on a cache miss."""
 
@@ -314,18 +360,18 @@ def _resolve_plan_token(op_name: str, inputs: tuple[torch.Tensor, ...]) -> int:
         raise RuntimeError(
             f"{family.name!r} requires {family.num_inputs} inputs, got {len(inputs)}"
         )
-    reference = inputs[family.primary_input_indices[0]]
     for tensor in inputs:
-        if tensor.dtype != reference.dtype:
-            raise RuntimeError(f"{family.name!r} requires one input dtype")
-        if tensor.device != reference.device:
-            raise RuntimeError(f"{family.name!r} requires one input device")
-
+        if tensor.dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(
+                f"Unsupported PT2 pointwise dtype {tensor.dtype} for {family.name!r}; "
+                "supported dtypes are float16, bfloat16 and float32"
+            )
+    _, shape, _, dtypes, collapsed = family.source_pointwise.prepare_metadata(*inputs)
     key = (
         family.name,
-        reference.ndim,
-        reference.dtype,
-        _layout_class(family, inputs),
+        len(shape),
+        dtypes[0],
+        "contiguous_c" if collapsed else "strided",
     )
     plan = _PLANS_BY_KEY.get(key)
     if plan is None:
@@ -340,24 +386,11 @@ def _resolve_plan_token(op_name: str, inputs: tuple[torch.Tensor, ...]) -> int:
 def _check_contract(plan: PointwisePlan, inputs: tuple[torch.Tensor, ...]) -> None:
     torch._check(len(inputs) == plan.num_inputs)
     reference = inputs[plan.primary_input_indices[0]]
-    torch._check(reference.ndim == plan.ndim)
-
     for index, tensor in enumerate(inputs):
-        torch._check(tensor.dtype == plan.dtype)
+        torch._check(tensor.dtype in _SUPPORTED_DTYPES)
         torch._check(tensor.device == reference.device)
         if index in plan.scalar_input_indices:
             torch._check(tensor.numel() == 1)
-            continue
-        torch._check(tensor.ndim == plan.ndim)
-        for axis in range(plan.ndim):
-            torch._check(tensor.shape[axis] == reference.shape[axis])
-        if plan.layout_class == "contiguous_c":
-            torch._check(tensor.is_contiguous())
-        else:
-            torch._check(not tensor.is_contiguous())
-            torch._check(tensor.stride(plan.ndim - 1) == 1)
-            for axis in range(plan.ndim - 1):
-                torch._check(tensor.stride(axis) >= tensor.stride(axis + 1))
 
 
 def _task_shape(plan: PointwisePlan, out: torch.Tensor):
@@ -367,17 +400,14 @@ def _task_shape(plan: PointwisePlan, out: torch.Tensor):
     return (out.numel(),)
 
 
-def _runtime_strides(plan: PointwisePlan, tensor: torch.Tensor, *, scalar: bool):
-    if scalar:
-        return (0,) * plan.kernel_ndim
-    if plan.kernel_ndim == plan.ndim:
-        return tensor.stride()
-    torch._check(plan.kernel_ndim == 1)
-    return (1,)
+def _runtime_strides(plan: PointwisePlan, tensor: torch.Tensor, task_shape):
+    if plan.layout_class == "contiguous_c":
+        return (1,)
+    return broadcasted_stride(tensor.shape, tensor.stride(), task_shape)
 
 
 def _partition(plan: PointwisePlan, out: torch.Tensor):
-    """PT2-safe transcription of the generated wrapper's launch policy."""
+    """Use the eager wrapper's tile and balanced-grid helpers."""
 
     shape = _task_shape(plan, out)
     num_tasks = out.numel()
@@ -388,31 +418,22 @@ def _partition(plan: PointwisePlan, out: torch.Tensor):
         # That ABI must be materialized outside Dynamo as a different plan.
         torch._check(num_tasks <= 2_147_483_647)
 
-    if plan.materialization.prefer_1d_tile:
-        tile_size = min(
-            plan.materialization.max_tile_size,
-            triton.next_power_of_2(num_tasks),
-        )
-        tile_sizes = (tile_size,)
-        num_tiles = triton.cdiv(num_tasks, tile_size)
-    else:
-        remaining = plan.materialization.max_tile_size
-        reversed_tiles = []
-        for axis in reversed(range(plan.kernel_ndim)):
-            tile_size = min(remaining, triton.next_power_of_2(shape[axis]))
-            reversed_tiles.append(tile_size)
-            remaining = max(1, remaining // tile_size)
-        tile_sizes = tuple(reversed(reversed_tiles))
-        num_tiles = 1
-        for size, tile_size in zip(shape, tile_sizes):
-            num_tiles *= triton.cdiv(size, tile_size)
+    tile_shape = (num_tasks,) if plan.materialization.prefer_1d_tile else shape
+    tile_sizes = heuristics_for_tile_size(
+        plan.materialization.max_tile_size, *tile_shape
+    )
+    num_tiles = math.prod(
+        triton.cdiv(size, tile_size) for size, tile_size in zip(tile_shape, tile_sizes)
+    )
 
-    num_ctas = min(plan.materialization.max_grid_size[0], num_tiles)
-    tiles_per_cta = triton.cdiv(num_tiles, num_ctas)
-    tile_volume = 1
-    for tile_size in tile_sizes:
-        tile_volume *= tile_size
-    num_warps = plan.num_warps_policy(tile_volume)
+    if plan.materialization.balance_grid:
+        num_ctas, tiles_per_cta = _balanced_grid_partition(
+            num_tiles, plan.materialization.max_grid_size[0]
+        )
+    else:
+        num_ctas = min(plan.materialization.max_grid_size[0], num_tiles)
+        tiles_per_cta = triton.cdiv(num_tiles, num_ctas)
+    num_warps = plan.num_warps_policy(math.prod(tile_sizes))
     return (
         (num_ctas, 1, 1),
         num_tasks,
@@ -426,26 +447,24 @@ def _partition(plan: PointwisePlan, out: torch.Tensor):
 def _launch_plan(
     plan: PointwisePlan,
     inputs: tuple[torch.Tensor, ...],
-    out: torch.Tensor,
+    outputs: tuple[torch.Tensor, ...],
     launch,
 ) -> None:
     grid, num_tasks, tiles_per_cta, tiles, one_tile, num_warps = launch
     wrapped = torch.library.wrap_triton(plan.jit_function)
-    args = [*inputs, out]
-    for index, tensor in enumerate(inputs):
-        is_scalar = index in plan.scalar_input_indices
-        args.extend(_runtime_strides(plan, tensor, scalar=is_scalar))
-        if is_scalar:
-            stride_order = plan.scalar_stride_order
-        else:
-            stride_order = plan.tensor_stride_order
-        if plan.materialization.prefer_block_pointer:
-            args.extend(stride_order)
+    args = [*inputs, *outputs]
+    task_shape = _task_shape(plan, outputs[0])
+    use_block_pointer = (
+        plan.materialization.prefer_block_pointer
+        and not plan.materialization.prefer_1d_tile
+    )
+    for tensor in (*inputs, *outputs):
+        strides = _runtime_strides(plan, tensor, task_shape)
+        args.extend(strides)
+        if use_block_pointer:
+            args.extend(stride_order(strides))
 
-    args.extend(_runtime_strides(plan, out, scalar=False))
-    if plan.materialization.prefer_block_pointer:
-        args.extend(plan.tensor_stride_order)
-    args.extend(_task_shape(plan, out))
+    args.extend(task_shape)
     args.append(num_tasks)
 
     kwargs = {
@@ -461,15 +480,31 @@ def _launch_plan(
     wrapped[grid](*args, **kwargs)
 
 
-def _execute_plan(inputs: tuple[torch.Tensor, ...], plan_token: int) -> torch.Tensor:
+def _execute_plan(
+    inputs: tuple[torch.Tensor, ...], plan_token: int
+) -> tuple[torch.Tensor, ...]:
     plan = _PLANS_BY_TOKEN[plan_token]
     _check_contract(plan, inputs)
-    reference = inputs[plan.primary_input_indices[0]]
-    out = torch.empty_like(reference)
-    launch = _partition(plan, out)
+    task_shape, shape, reference, dtypes, collapsed = _family(
+        plan.op_name
+    ).source_pointwise.prepare_metadata(*inputs)
+    torch._check(len(shape) == plan.ndim)
+    torch._check(len(task_shape) == plan.kernel_ndim)
+    torch._check(collapsed == (plan.layout_class == "contiguous_c"))
+    torch._check(len(dtypes) == plan.num_outputs)
+    torch._check(dtypes[0] == plan.dtype)
+    outputs = tuple(
+        (
+            torch.empty_like(reference, dtype=dtype)
+            if reference is not None
+            else torch.empty(shape, dtype=dtype, device=inputs[0].device)
+        )
+        for dtype in dtypes
+    )
+    launch = _partition(plan, outputs[0])
     if launch is not None:
-        _launch_plan(plan, inputs, out, launch)
-    return out
+        _launch_plan(plan, inputs, outputs, launch)
+    return outputs
 
 
 if _HAS_TRITON_OP:
@@ -478,13 +513,13 @@ if _HAS_TRITON_OP:
     def _silu_and_mul_pointwise_op(
         gate: torch.Tensor, up: torch.Tensor, plan_token: int
     ) -> torch.Tensor:
-        return _execute_plan((gate, up), plan_token)
+        return _execute_plan((gate, up), plan_token)[0]
 
     @torch.library.triton_op("flag_gems_pt2::gelu_and_mul_pointwise", mutates_args={})
     def _gelu_and_mul_pointwise_op(
         gate: torch.Tensor, up: torch.Tensor, plan_token: int
     ) -> torch.Tensor:
-        return _execute_plan((gate, up), plan_token)
+        return _execute_plan((gate, up), plan_token)[0]
 
     @torch.library.triton_op(
         "flag_gems_pt2::silu_and_mul_with_clamp_pointwise", mutates_args={}
@@ -495,12 +530,45 @@ if _HAS_TRITON_OP:
         limit: torch.Tensor,
         plan_token: int,
     ) -> torch.Tensor:
-        return _execute_plan((gate, up, limit), plan_token)
+        return _execute_plan((gate, up, limit), plan_token)[0]
+
+    @torch.library.triton_op("flag_gems_pt2::activation_backward", mutates_args={})
+    def _activation_backward_op(
+        inputs: list[torch.Tensor], plan_token: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dx, dy = _execute_plan(tuple(inputs), plan_token)
+        return dx, dy
+
+    def _setup_activation_context(ctx, inputs, output):
+        *tensors, plan_token = inputs
+        ctx.save_for_backward(*tensors)
+        ctx.backward_family = _PLANS_BY_TOKEN[plan_token].op_name + ".backward"
+
+    def _activation_backward(ctx, grad_output):
+        x, y, *extra = ctx.saved_tensors
+        inputs = (x, y, grad_output, *extra)
+        token = _resolve_plan_token(ctx.backward_family, inputs)
+        dx, dy = _activation_backward_op(list(inputs), token)
+        # The source kernels are elementwise. Broadcast axes belong to the
+        # caller's input tensors and must be reduced before returning gradients.
+        dx = dx.sum_to_size(x.shape).to(x.dtype)
+        dy = dy.sum_to_size(y.shape).to(y.dtype)
+        return (dx, dy, *((None,) * len(extra)), None)
+
+    for _op in (
+        _silu_and_mul_pointwise_op,
+        _gelu_and_mul_pointwise_op,
+        _silu_and_mul_with_clamp_pointwise_op,
+    ):
+        _op.register_autograd(
+            _activation_backward, setup_context=_setup_activation_context
+        )
 
 else:
     _silu_and_mul_pointwise_op = None
     _gelu_and_mul_pointwise_op = None
     _silu_and_mul_with_clamp_pointwise_op = None
+    _activation_backward_op = None
 
 
 _POINTWISE_REQUIRES = (
@@ -548,6 +616,19 @@ SILU_AND_MUL_WITH_CLAMP_POINTWISE_SPEC = register_compile_spec(
     )
 )
 
+ACTIVATION_BACKWARD_POINTWISE_SPEC = register_compile_spec(
+    CompileOpSpec(
+        op_name="flag_gems_pt2::activation_backward",
+        kind=CompileKind.TRITON_TRACEABLE,
+        source_kernel=(
+            "original silu_and_mul, gelu_{none,tanh}_and_mul and "
+            "silu_and_mul_with_clamp gradient kernels.materialize(ndim).jit_function"
+        ),
+        dynamic_dims=("n_tokens",),
+        requires=_POINTWISE_REQUIRES,
+    )
+)
+
 
 def _missing_triton_op() -> RuntimeError:
     return RuntimeError(
@@ -564,7 +645,7 @@ def silu_and_mul_pointwise(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor
             raise _missing_triton_op()
         plan_token = _resolve_plan_token(SILU_AND_MUL_FAMILY.name, (gate, up))
         return _silu_and_mul_pointwise_op(gate, up, plan_token)
-    return SILU_AND_MUL_FAMILY.source_pointwise(gate, up)
+    return _eager_silu(gate, up)
 
 
 def gelu_and_mul_pointwise(
@@ -578,7 +659,7 @@ def gelu_and_mul_pointwise(
             raise _missing_triton_op()
         plan_token = _resolve_plan_token(family.name, (gate, up))
         return _gelu_and_mul_pointwise_op(gate, up, plan_token)
-    return family.source_pointwise(gate, up)
+    return _eager_gelu(gate, up, approximate)
 
 
 def silu_and_mul_with_clamp_pointwise(
@@ -592,28 +673,30 @@ def silu_and_mul_with_clamp_pointwise(
             raise _missing_triton_op()
         plan_token = _resolve_plan_token(SILU_AND_MUL_WITH_CLAMP_FAMILY.name, inputs)
         return _silu_and_mul_with_clamp_pointwise_op(gate, up, limit, plan_token)
-    return SILU_AND_MUL_WITH_CLAMP_FAMILY.source_pointwise(*inputs)
+    return _eager_silu_clamp(gate, up, limit)
 
 
 __all__ = [
+    "ACTIVATION_BACKWARD_POINTWISE_FAMILIES",
+    "ACTIVATION_BACKWARD_POINTWISE_SPEC",
     "ACTIVATION_POINTWISE_FAMILIES",
+    "gelu_and_mul_pointwise",
     "GELU_AND_MUL_POINTWISE_SPEC",
     "GELU_NONE_AND_MUL_FAMILY",
     "GELU_TANH_AND_MUL_FAMILY",
-    "PointwiseFamilySpec",
-    "PointwisePlan",
-    "SILU_AND_MUL_FAMILY",
-    "SILU_AND_MUL_POINTWISE_SPEC",
-    "SILU_AND_MUL_WITH_CLAMP_FAMILY",
-    "SILU_AND_MUL_WITH_CLAMP_POINTWISE_SPEC",
-    "gelu_and_mul_pointwise",
     "materialize_gelu_and_mul_plan",
     "materialize_pointwise_family_plans",
     "materialize_pointwise_plan",
     "materialize_silu_and_mul_plan",
     "materialize_silu_and_mul_with_clamp_plan",
     "materialized_pointwise_plans",
+    "PointwiseFamilySpec",
+    "PointwisePlan",
     "register_pointwise_family",
+    "SILU_AND_MUL_FAMILY",
     "silu_and_mul_pointwise",
+    "SILU_AND_MUL_POINTWISE_SPEC",
+    "SILU_AND_MUL_WITH_CLAMP_FAMILY",
     "silu_and_mul_with_clamp_pointwise",
+    "SILU_AND_MUL_WITH_CLAMP_POINTWISE_SPEC",
 ]

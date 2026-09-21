@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
+
 logger = logging.getLogger(__name__)
 
 
@@ -252,6 +254,19 @@ def grouped_topk(
     bias: torch.Tensor,
     scoring_func: int = 0,
 ):
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.moe_routing import grouped_topk as _pt2_grouped_topk
+
+        return _pt2_grouped_topk(
+            scores,
+            n_group,
+            topk_group,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            bias,
+            scoring_func,
+        )
     logger.debug("GEMS GROUPED TOPK")
     if scores.ndim != 2:
         raise ValueError("scores must be a 2D Tensor")

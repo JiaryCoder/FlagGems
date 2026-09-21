@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
 from flag_gems.utils import pointwise_dynamic, tl_extra_shim
 
 erf = tl_extra_shim.erf
@@ -130,4 +131,8 @@ class GeluAndMul(torch.autograd.Function):
 
 
 def gelu_and_mul(x, y, approximate="none"):
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.pointwise_dynamic import gelu_and_mul_pointwise
+
+        return gelu_and_mul_pointwise(x, y, approximate)
     return GeluAndMul.apply(x, y, approximate)

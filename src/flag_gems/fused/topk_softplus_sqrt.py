@@ -24,8 +24,11 @@ during the loop and re-reading with scale at the end.
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
+
+from flag_gems import runtime
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +212,20 @@ def topk_softplus_sqrt(
         input_ids: Token IDs for hash mode [num_tokens]
         tid2eid: Hash table mapping tokens to expert indices
     """
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.moe_routing import topk_softplus_sqrt as _pt2_topk
+
+        return _pt2_topk(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            routed_scaling_factor,
+            correction_bias,
+            input_ids,
+            tid2eid,
+        )
     logger.debug("GEMS TOPK_SOFTPLUS_SQRT")
     num_tokens, num_experts = gating_output.shape
     topk = topk_weights.shape[1]

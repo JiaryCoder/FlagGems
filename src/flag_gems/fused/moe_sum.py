@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,6 +73,10 @@ def moe_sum(
     input: torch.Tensor,
     output: torch.Tensor,
 ):
+    if torch.compiler.is_compiling() and runtime.device.vendor_name == "nvidia":
+        from flag_gems.pt2.fused_moe import moe_sum as _pt2_moe_sum
+
+        return _pt2_moe_sum(input, output)
     logger.debug("GEMS MOE SUM")
     num_tokens, topk, hidden_size = input.shape
     input_strides = input.stride()
