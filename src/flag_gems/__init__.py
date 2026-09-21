@@ -16,6 +16,8 @@
 import warnings
 
 import torch
+from packaging import version
+
 from flag_gems import testing  # noqa: F401
 from flag_gems import runtime
 from flag_gems.config import aten_patch_list, resolve_user_setting
@@ -30,7 +32,6 @@ from flag_gems.patches import patch_empty_vllm  # noqa: F401
 from flag_gems.runtime import flagtune
 from flag_gems.runtime.backend import SpecOpRegistrar
 from flag_gems.runtime.op_registrar import GeneralOpRegistrar
-from packaging import version
 
 try:
     from flag_gems._version import commit_id as _commit_id

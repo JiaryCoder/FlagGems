@@ -5,9 +5,10 @@
 
 import pytest
 import torch
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
+
 from flag_gems.utils.shape_utils import is_non_overlapping_and_dense, stride_order
 from flag_gems.utils.type_utils import type_promotion
-from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
 
 
 @pytest.fixture(autouse=True)

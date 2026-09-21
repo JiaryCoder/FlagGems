@@ -5,10 +5,11 @@
 
 import importlib
 
-import flag_gems
 import pytest
 import torch
 import torch.nn.functional as F
+
+import flag_gems
 
 pytestmark = pytest.mark.skipif(
     flag_gems.vendor_name != "nvidia" or not hasattr(torch.library, "triton_op"),

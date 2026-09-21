@@ -20,6 +20,8 @@ from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence, T
 
 import torch
 import triton
+from triton.runtime.jit import JITFunction
+
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils.code_cache import code_cache_dir
 from flag_gems.utils.code_utils import IndentedBuffer, write_atomic
@@ -38,7 +40,6 @@ from flag_gems.utils.shape_utils import (
 )
 from flag_gems.utils.tensor_wrapper import StridedBuffer
 from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
-from triton.runtime.jit import JITFunction
 
 
 # ------------------ Operation Description ---------------------------

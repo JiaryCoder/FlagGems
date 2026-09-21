@@ -3,10 +3,11 @@
 
 """Public API training and inference contracts for the NVIDIA PT2 adapters."""
 
-import flag_gems
 import pytest
 import torch
 import torch.nn.functional as F
+
+import flag_gems
 
 pytestmark = pytest.mark.skipif(
     flag_gems.vendor_name != "nvidia" or not hasattr(torch.library, "triton_op"),

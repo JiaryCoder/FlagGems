@@ -37,6 +37,7 @@ from typing import Callable, Iterable
 
 import torch
 import triton
+
 from flag_gems.fused.gelu_and_mul import gelu_and_mul as _eager_gelu
 from flag_gems.fused.gelu_and_mul import (
     gelu_none_and_mul_grad_kernel as _gelu_none_grad_source,
